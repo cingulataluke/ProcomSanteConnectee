@@ -3,23 +3,26 @@ import csv
 import datetime
 from decouple import config
 from utility import ensure_parent_dir, get_num_input_from_list
+import json
+
+PAGE_SIZE = 1000
 
 # Connect to LAMP server
 LAMP.connect(server_address=config('URL', cast=str),
              access_key=config('EMAIL', cast=str),
              secret_key=config('PASSWORD', cast=str))
 
-# Retrieve study with name "Procom"
+# Retrieve study with name "Test Investigator"
 studies_by_researcher = LAMP.Study.all_by_researcher(config('RESEARCHER', cast=str))
 studies_by_researcher = studies_by_researcher['data']
-study = next((s for s in studies_by_researcher if s["name"] == "Procom"), None)
+study = next((s for s in studies_by_researcher if s["name"] == "Test Investigator"), None)
 if not study:
-    raise ValueError("Study 'Procom' not found.")
+    raise ValueError("Study not found.")
 
 print(f"Selected study: {study['name']}")
 # Retrieve all participants by study
 participants = LAMP.Participant.all_by_study(study['id'])['data']
-print(f"Found {len(participants)} participants in study 'Procom'.")
+print(f"Found {len(participants)} participants in study 'Test Investigator'.")
 
 # select all participants
 participants_to_export = [participant['id'] for participant in participants]
@@ -27,13 +30,54 @@ name = 'all'
 print(f"Selected all participants for export.")
 
 
+def fetch_all_activity_events(participant_id, page_size=PAGE_SIZE):
+    """Fetch every ActivityEvent of a participant by paginating backwards in time."""
+    all_events = []
+    seen = set()          # dedupe key: events sharing the boundary timestamp can be returned twice
+    cursor = None         # 'to' bound (ms); None = no upper bound (start from the latest)
+
+    while True:
+        kwargs = {"_limit": page_size}    # positive limit => latest events first
+        if cursor is not None:
+            kwargs["to"] = cursor
+
+        batch = LAMP.ActivityEvent.all_by_participant(participant_id, **kwargs)["data"]
+        if not batch:
+            break
+
+        new_events = 0
+        for event in batch:
+            key = (
+                event["timestamp"],
+                event.get("activity"),
+                json.dumps(event.get("temporal_slices"), sort_keys=True, default=str),
+            )
+            if key not in seen:
+                seen.add(key)
+                all_events.append(event)
+                new_events += 1
+
+        oldest_ts = min(e["timestamp"] for e in batch)
+
+        if new_events == 0:
+            # Whole page was already seen (inclusive 'to' bound, or 1000+ events sharing one timestamp)
+            if len(batch) >= page_size:
+                print(f"  Warning: {page_size}+ events share timestamp {oldest_ts}, some may be lost.")
+            cursor = oldest_ts - 1
+        else:
+            cursor = oldest_ts   # keep the boundary; dedupe handles the overlap
+
+        print(f"  {participant_id}: {len(all_events)} events so far (oldest: {oldest_ts})")
+
+    return all_events
+
+
 # Export activity data for each participant
 result = {}
 for identifier in participants_to_export:
     print(f"Fetching data for participant: {identifier}")
-    activity_data = LAMP.ActivityEvent.all_by_participant(identifier)['data']
-    result[identifier] = activity_data
-    print(f"Fetched {len(activity_data)} events for participant {identifier}")
+    result[identifier] = fetch_all_activity_events(identifier)
+    print(f"Fetched {len(result[identifier])} events for participant {identifier}")
 
 # Define CSV file name
 csv_filename = f'output/activity/aexport_activity_{name}_{str(datetime.datetime.now()).split(" ")[0]}.csv'
